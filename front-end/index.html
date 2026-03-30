@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TUA Tulpar V3.2 | Real-Time 3D Orbit</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap" rel="stylesheet">
+  <style>
+    body { margin: 0; background-color: #020617; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; overflow: hidden; }
+    canvas { display: block; }
+    .glass { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(16px); border: 1px solid rgba(56, 189, 248, 0.15); }
+    .telemetry-scroll::-webkit-scrollbar { width: 4px; }
+    .telemetry-scroll::-webkit-scrollbar-thumb { background: #38bdf8; border-radius: 10px; }
+    @keyframes pulse-cyan { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.05); } }
+    .status-pulse { animation: pulse-cyan 2s infinite; }
+    .ui-fade-in { animation: fadeIn 0.5s ease-out forwards; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+
+<div id="ui-root" class="fixed inset-0 z-20 flex flex-col p-6 pointer-events-none">
+  <header id="main-header" class="flex justify-between items-center glass p-4 rounded-2xl pointer-events-auto border-l-4 border-l-cyan-500 shadow-2xl">
+    <div>
+      <h1 class="text-xl font-black text-cyan-400 italic tracking-tighter">ORBİTEYES</h1>
+      <p class="text-[9px] text-slate-400 uppercase tracking-widest"></p>
+    </div>
+    <div id="clock" class="text-sm font-bold text-cyan-500">00:00:00 UTC</div>
+  </header>
+
+  <div id="dashboard-layout" class="mt-6 flex flex-1 gap-6 overflow-hidden">
+
+
+    <div class="w-80 flex flex-col gap-6 h-full pointer-events-none">
+
+
+      <aside id="satellite-list" class="flex-1 glass rounded-2xl p-4 overflow-y-auto telemetry-scroll pointer-events-auto flex flex-col gap-3 shadow-xl">
+        <h2 class="text-[10px] font-bold text-slate-500 uppercase mb-2 border-b border-slate-800 pb-2">Aktif Uydular & Telemetri</h2>
+        <div id="list-container" class="flex flex-col gap-3"></div>
+      </aside>
+
+
+      <div id="log-panel" class="h-48 shrink-0 glass rounded-xl p-3 overflow-y-auto telemetry-scroll pointer-events-auto flex flex-col gap-1 shadow-xl border border-slate-800 ui-fade-in relative">
+        <div class="text-[10px] text-cyan-500 font-bold border-b border-slate-700 pb-1 mb-1 sticky top-0 bg-[#020617]/80 backdrop-blur-sm z-10 flex justify-between">
+          <span>SİSTEM LOGLARI</span>
+          <span class="animate-pulse text-green-400">● LIVE</span>
+        </div>
+        <div id="log-content" class="flex flex-col gap-1"></div>
+      </div>
+
+    </div>
+
+
+    <main id="detail-panel" class="flex-1 glass rounded-3xl p-8 border-2 border-cyan-500/20 hidden pointer-events-auto relative overflow-hidden shadow-2xl ui-fade-in">
+      <div id="detail-content"></div>
+    </main>
+  </div>
+
+  <div id="analysis-page" class="hidden fixed inset-0 z-30 bg-[#020617]/95 backdrop-blur-xl p-8 overflow-y-auto pointer-events-auto telemetry-scroll">
+    <div id="analysis-content" class="max-w-7xl mx-auto"></div>
+  </div>
+
+</div>
+
+<div id="canvas-container" class="fixed inset-0 z-10"></div>
+
+<script>
+  // Backend API URL
+  const BASE_URL = "http://##############:8080/api/v1/satellites/all";
+
+  const modelPaths = {
+    "IMECE": "satellite_toymodel.glb",
+    "GOKTURK-1": "loral_ssl-1300_satellite.glb",
+    "GOKTURK-2": "satellite (3).glb",
+    "TURKSAT-5B": "meteor-m2_no.2.glb",
+    "TURKSAT-6A": "satellite (2).glb",
+    "BILSAT": "simple_satellite_low_poly_free.glb",
+    "RASAT": "satellite (2).glb",
+    "TURKSAT-4A": "satellite_low_poly.glb",
+    "GOKTURK-3": "space_satellite.glb",
+    "TURKSAT-4B": "meteor-m2_no.2.glb",
+    "TURKSAT-3A": "satellite (3).glb"
+  };
+
+  let scene, camera, renderer, earth, stars, satelliteMeshes = [];
+  let hitboxes = [];
+  let orbitLines = [];
+  let raycaster, mouse;
+  let satellitesData = [];
+  let controls;
+
+  let currentFocusedSat = null;
+  let currentAnalysisSat = null;
+
+  const loader = new THREE.GLTFLoader();
+  const cachedModels = {};
+
+  function addLog(msg, type = "info") {
+    const logBox = document.getElementById('log-content');
+    const time = new Date().toLocaleTimeString('tr-TR', { hour12: false });
+
+    let color = 'text-slate-400';
+    if(type === 'error') color = 'text-red-400';
+    if(type === 'success') color = 'text-green-400';
+    if(type === 'warning') color = 'text-yellow-400';
+    if(type === 'update') color = 'text-cyan-400';
+
+    const logItem = document.createElement('div');
+    logItem.className = `text-[9px] font-mono ${color} break-words leading-tight`;
+    logItem.innerHTML = `<span class="text-slate-600">[${time}]</span> ${msg}`;
+
+    logBox.appendChild(logItem);
+
+    const panel = document.getElementById('log-panel');
+    panel.scrollTop = panel.scrollHeight;
+
+    if (logBox.children.length > 50) {
+      logBox.removeChild(logBox.firstChild);
+    }
+  }
+
+  function createFallbackSatellite() {
+    const group = new THREE.Group();
+    const bodyGeo = new THREE.BoxGeometry(0.8, 1.2, 0.8);
+    const bodyMat = new THREE.MeshPhongMaterial({ color: 0xd4af37, shininess: 100 });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    group.add(body);
+
+    const panelGeo = new THREE.BoxGeometry(3.5, 0.3, 0.05);
+    const panelMat = new THREE.MeshPhongMaterial({ color: 0x1e3a8a, emissive: 0x0ea5e9, emissiveIntensity: 0.3 });
+    const panel = new THREE.Mesh(panelGeo, panelMat);
+    group.add(panel);
+
+    const dishGeo = new THREE.SphereGeometry(0.4, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2);
+    const dishMat = new THREE.MeshPhongMaterial({ color: 0x94a3b8, side: THREE.DoubleSide });
+    const dish = new THREE.Mesh(dishGeo, dishMat);
+    dish.position.y = 0.6;
+    dish.rotation.x = Math.PI;
+    group.add(dish);
+
+    group.scale.set(0.8, 0.8, 0.8);
+    return group;
+  }
+
+  async function preloadModels() {
+    addLog("3D Modeller yükleniyor...", "info");
+    const promises = Object.entries(modelPaths).map(([name, path]) => {
+      return new Promise((resolve) => {
+        loader.load(path, (gltf) => {
+          const model = gltf.scene;
+          const box = new THREE.Box3().setFromObject(model);
+          const size = new THREE.Vector3();
+          box.getSize(size);
+          const maxDim = Math.max(size.x, size.y, size.z);
+          const scaleFactor = 3.0 / maxDim;
+          model.scale.set(scaleFactor, scaleFactor, scaleFactor);
+          cachedModels[name] = model;
+          resolve();
+        }, undefined, () => resolve());
+      });
+    });
+    await Promise.all(promises);
+    addLog("Modeller başarıyla belleğe alındı.", "success");
+  }
+
+  function init3D() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 2.0));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+    sun.position.set(10, 10, 10);
+    scene.add(sun);
+
+    const starCanvas = document.createElement('canvas');
+    starCanvas.width = 32;
+    starCanvas.height = 32;
+    const ctx = starCanvas.getContext('2d');
+    const gradient = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+    gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+    gradient.addColorStop(0.1, 'rgba(255, 255, 255, 0.8)');
+    gradient.addColorStop(0.4, 'rgba(120, 200, 255, 0.3)');
+    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, 32, 32);
+    const starTexture = new THREE.CanvasTexture(starCanvas);
+
+    const starGeo = new THREE.BufferGeometry();
+    const starCount = 8000;
+    const starPositions = new Float32Array(starCount * 3);
+    for(let i=0; i<starCount*3; i++) {
+      starPositions[i] = (Math.random() - 0.5) * 1500;
+    }
+    starGeo.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+
+    const starMat = new THREE.PointsMaterial({
+      color: 0xffffff,
+      size: 3.5,
+      map: starTexture,
+      transparent: true,
+      opacity: 1.0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    stars = new THREE.Points(starGeo, starMat);
+    scene.add(stars);
+
+    const textureLoader = new THREE.TextureLoader();
+    earth = new THREE.Mesh(
+            new THREE.SphereGeometry(5, 64, 64),
+            new THREE.MeshPhongMaterial({
+              map: textureLoader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/planets/earth_atmos_2048.jpg'),
+              specular: new THREE.Color(0x333333),
+              shininess: 15
+            })
+    );
+    scene.add(earth);
+
+    camera.position.set(0, 15, 30);
+
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.minDistance = 7;
+    controls.maxDistance = 150;
+    controls.enablePan = false;
+
+    raycaster = new THREE.Raycaster();
+    mouse = new THREE.Vector2();
+
+
+    window.addEventListener('click', onCanvasClick);
+    window.addEventListener('mousemove', onCanvasHover);
+    window.addEventListener('resize', onWindowResize);
+
+    animate();
+  }
+
+  function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  async function fetchSatellites() {
+    addLog("📡 Backend ile iletişim kuruluyor...", "info");
+    try {
+      const response = await fetch(BASE_URL);
+      if (!response.ok) throw new Error(`HTTP Hata: ${response.status}`);
+      const data = await response.json();
+
+      let updateCount = 0;
+      satellitesData = data.map((s, i) => {
+        const features = {};
+        for(let f=1; f<=38; f++) {
+          features[`feat_${f}`] = s[`feat_${f}`] !== undefined ? s[`feat_${f}`] : "VERİ YOK";
+        }
+        updateCount++;
+
+        return {
+          id: s.eventId || `EVT-${i}`,
+          name: s.eventId ? guessModelName(s.eventId) : Object.keys(modelPaths)[i % Object.keys(modelPaths).length],
+          risk: s.riskScore !== undefined ? s.riskScore : (s.risk !== undefined ? s.risk : 0),
+          time_to_tca: s.f01TimeToTca !== undefined ? s.f01TimeToTca : "YOK",
+          miss_distance_km: s.f02SatX !== undefined ? s.f02SatX : "YOK",
+          radius: 8 + (i * 1.5),
+          speed: 0.0002 + (Math.random() * 0.0004),
+          angle: Math.random() * Math.PI * 2,
+          inclination: (Math.random() - 0.5) * 0.4,
+          features: features
+        };
+      });
+
+      addLog(`✅ Telemetri güncellendi. Aktif uydu sayısı: ${updateCount}`, "success");
+
+    } catch (error) {
+      addLog(`❌ Backend bağlantı hatası: ${error.message}`, "error");
+
+
+    }
+
+    if (satellitesData.length > 0) {
+      if (satelliteMeshes.length === 0) {
+        addLog("Sahne oluşturuluyor...", "info");
+        createSatellites();
+      } else {
+        addLog("Arayüz verileri tazelendi.", "update");
+        updateExistingSatellites();
+      }
+    } else {
+      addLog("Gösterilecek aktif telemetri verisi yok.", "warning");
+    }
+  }
+
+  function guessModelName(eventId) {
+    const e = eventId.toUpperCase();
+
+
+    if (e.includes("GK1") || e.includes("GOKTURK-1")) return "GOKTURK-1";
+    if (e.includes("GK2") || e.includes("GOKTURK-2")) return "GOKTURK-2";
+    if (e.includes("GK3") || e.includes("GOKTURK-3")) return "GOKTURK-3";
+
+
+    if (e.includes("T3A") || e.includes("TURKSAT-3A")) return "TURKSAT-3A";
+    if (e.includes("T4A") || e.includes("TURKSAT-4A")) return "TURKSAT-4A";
+    if (e.includes("T4B") || e.includes("TURKSAT-4B")) return "TURKSAT-4B";
+    if (e.includes("T5A") || e.includes("TURKSAT-5A")) return "TURKSAT-5A";
+    if (e.includes("T5B") || e.includes("TURKSAT-5B")) return "TURKSAT-5B";
+    if (e.includes("T6A") || e.includes("TURKSAT-6A")) return "TURKSAT-6A";
+
+
+    if (e.includes("BIL") || e.includes("BILSAT")) return "BILSAT";
+    if (e.includes("RAS") || e.includes("RASAT")) return "RASAT";
+    if (e.includes("IME") || e.includes("IMECE")) return "IMECE";
+
+    return "UYDU";
+  }
+
+  function createSatellites() {
+    satellitesData.forEach((satData, i) => {
+      const satGroup = new THREE.Group();
+
+      let model;
+      if (cachedModels[satData.name]) {
+        model = cachedModels[satData.name].clone();
+      } else {
+        model = createFallbackSatellite();
+      }
+
+      satGroup.add(model);
+      satGroup.userData = satData;
+
+      const hitboxGeo = new THREE.SphereGeometry(3.5, 16, 16);
+      const hitboxMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 });
+      const hitbox = new THREE.Mesh(hitboxGeo, hitboxMat);
+      hitbox.userData = { name: satData.name };
+      satGroup.add(hitbox);
+      hitboxes.push(hitbox);
+
+      scene.add(satGroup);
+      satelliteMeshes.push(satGroup);
+
+      const points = [];
+      for(let j=0; j<=100; j++){
+        const a = (j/100) * Math.PI * 2;
+        points.push(new THREE.Vector3(Math.cos(a)*satData.radius, Math.sin(a)*satData.radius*satData.inclination, Math.sin(a)*satData.radius));
+      }
+
+      const orbitLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineBasicMaterial({color: 0x38bdf8, opacity: 0.15, transparent: true}));
+      scene.add(orbitLine);
+      orbitLines.push(orbitLine);
+    });
+
+    renderUI();
+  }
+
+  function updateExistingSatellites() {
+    satellitesData.forEach(newData => {
+      const mesh = satelliteMeshes.find(m => m.userData.name === newData.name);
+      if (mesh) {
+        mesh.userData.risk = newData.risk;
+        mesh.userData.time_to_tca = newData.time_to_tca;
+        mesh.userData.miss_distance_km = newData.miss_distance_km;
+        mesh.userData.features = newData.features;
+      }
+    });
+
+    renderUI();
+
+    if (currentFocusedSat) refreshDetailPanel(currentFocusedSat);
+    if (currentAnalysisSat) showDeepAnalysis(currentAnalysisSat, true);
+  }
+
+  function renderUI() {
+    const list = document.getElementById('list-container');
+    list.innerHTML = satelliteMeshes.map(m => {
+      const isCritical = m.userData.risk > 0.7;
+      const isWarning = m.userData.risk > 0.4;
+
+      const riskColorText = isCritical ? 'text-red-500' : (isWarning ? 'text-yellow-400' : 'text-green-400');
+      const riskColorBg = isCritical ? 'bg-red-500' : (isWarning ? 'bg-yellow-400' : 'bg-green-400');
+
+      return `
+      <div onclick="focusSatellite('${m.userData.name}')" class="p-3 rounded-xl border border-slate-800 bg-slate-900/60 cursor-pointer hover:border-cyan-500 pointer-events-auto transition-all shadow-md">
+
+        <div class="flex justify-between items-center text-[11px] font-bold uppercase mb-2 border-b border-slate-800 pb-1">
+            <span class="text-cyan-400 tracking-wider">${m.userData.name}</span>
+            <div class="flex items-center gap-2">
+                <span class="${riskColorText} font-mono">${Number(m.userData.risk).toFixed(4)}</span>
+                <div class="w-1.5 h-1.5 rounded-full ${riskColorBg} status-pulse"></div>
+            </div>
+        </div>
+
+
+        <div class="grid grid-cols-2 gap-2 text-[9px] text-slate-400 uppercase font-mono">
+            <div>
+                <span class="block text-slate-600 mb-0.5">TCA Süresi</span>
+                <span class="text-white">${m.userData.time_to_tca} ${m.userData.time_to_tca !== "YOK" ? "s" : ""}</span>
+            </div>
+            <div>
+                <span class="block text-slate-600 mb-0.5">Kaçırma Mes.</span>
+                <span class="text-white">${m.userData.miss_distance_km} ${m.userData.miss_distance_km !== "YOK" ? "km" : ""}</span>
+            </div>
+        </div>
+      </div>
+      `
+    }).join('');
+  }
+
+
+  function focusSatellite(name) {
+    const mesh = satelliteMeshes.find(m => m.userData.name === name);
+    if(mesh) {
+      currentFocusedSat = name;
+
+      const panel = document.getElementById('detail-panel');
+      panel.classList.remove('hidden');
+      refreshDetailPanel(name);
+    }
+  }
+
+  function closeDetailPanel() {
+    document.getElementById('detail-panel').classList.add('hidden');
+    currentFocusedSat = null;
+  }
+
+  function refreshDetailPanel(name) {
+    const mesh = satelliteMeshes.find(m => m.userData.name === name);
+    if(!mesh) return;
+    const sat = mesh.userData;
+
+    document.getElementById('detail-content').innerHTML = `
+        <button onclick="closeDetailPanel()" class="absolute top-4 right-4 text-slate-500 hover:text-white transition-colors">✕</button>
+
+        <h2 class="text-5xl font-black italic uppercase tracking-tighter">${sat.name}</h2>
+        <div class="mt-4 flex gap-2">
+          <div class="inline-block px-3 py-1 rounded border ${sat.risk > 0.7 ? 'border-red-600/50 text-red-500' : 'border-green-500/30 text-green-400'} text-[10px] font-bold uppercase">${sat.risk > 0.7 ? 'KRİTİK' : 'STABİL'}</div>
+          <p class="text-[9px] text-slate-500 uppercase tracking-widest mt-1">TELEMETRİ: AKTİF</p>
+        </div>
+
+        <div class="mt-10 grid grid-cols-2 gap-4">
+            <div class="glass p-4 rounded-2xl border border-slate-800">
+                <p class="text-[8px] text-cyan-500 uppercase font-bold">TCA SÜRESİ</p>
+                <p class="text-xl font-black text-white">${sat.time_to_tca} ${sat.time_to_tca !== "YOK" ? "s" : ""}</p>
+            </div>
+            <div class="glass p-4 rounded-2xl border border-slate-800">
+                <p class="text-[8px] text-cyan-500 uppercase font-bold">KAÇIRMA MESAFESİ</p>
+                <p class="text-xl font-black text-white">${sat.miss_distance_km} ${sat.miss_distance_km !== "YOK" ? "km" : ""}</p>
+            </div>
+        </div>
+
+        <button onclick="showDeepAnalysis('${sat.name}')" class="w-full mt-10 bg-cyan-600 hover:bg-cyan-400 text-white py-4 rounded-xl font-black uppercase tracking-[0.2em] text-sm transition-all shadow-xl active:scale-95">
+          Detaylı Telemetri Analizi
+        </button>
+      `;
+  }
+
+  function closeDeepAnalysis() {
+    document.getElementById('analysis-page').classList.add('hidden');
+    currentAnalysisSat = null;
+  }
+
+  function showDeepAnalysis(name, isUpdate = false) {
+    const mesh = satelliteMeshes.find(m => m.userData.name === name);
+    if(!mesh) return;
+
+    currentAnalysisSat = name;
+    const sat = mesh.userData;
+    document.getElementById('analysis-page').classList.remove('hidden');
+
+    const isCritical = sat.risk > 0.7;
+    const riskColor = isCritical ? 'text-red-500' : (sat.risk > 0.4 ? 'text-yellow-400' : 'text-green-400');
+    const statusText = isCritical ? 'TEHLİKE' : (sat.risk > 0.4 ? 'UYARI' : 'GÜVENLİ');
+
+    let featsHtml = '';
+    for (let f = 5; f <= 38; f++) {
+      let val = sat.features[`feat_${f}`];
+      if (val === undefined || val === null || val === "undefined") val = "VERİ_YOK";
+
+      featsHtml += `
+          <div class="bg-[#0b132b] p-4 rounded-xl border border-[#1e293b] flex flex-col justify-center shadow-md">
+              <p class="text-[9px] text-cyan-500 font-bold mb-1 uppercase tracking-tighter">FEAT_${f}</p>
+              <p class="text-sm font-mono truncate text-slate-200">${val}</p>
+          </div>`;
+    }
+
+    const fadeClass = isUpdate ? "" : "ui-fade-in";
+
+    document.getElementById('analysis-content').innerHTML = `
+          <div class="flex flex-col gap-6 ${fadeClass} pb-10">
+
+              <div class="flex justify-between items-center mb-2">
+                  <button onclick="closeDeepAnalysis()" class="text-cyan-500 hover:text-white flex items-center gap-2 transition-all uppercase text-[10px] tracking-widest">
+                      <span>←</span> Kontrol Merkezine Dön
+                  </button>
+              </div>
+
+              <div class="mb-6">
+                  <p class="text-[10px] text-slate-500 uppercase tracking-[0.3em] font-bold mb-2">Deep Telemetry Stream</p>
+                  <h1 class="text-6xl md:text-7xl font-black uppercase tracking-tighter ${riskColor}">${sat.id}</h1>
+              </div>
+
+
+              <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+                  <div class="bg-[#0b132b] p-6 rounded-2xl border border-[#1e293b] shadow-lg">
+                      <p class="text-[10px] text-cyan-500 font-bold uppercase mb-2 tracking-widest">RİSK SKORU</p>
+                      <p class="text-3xl font-black ${riskColor}">${Number(sat.risk).toFixed(4)}</p>
+                  </div>
+                  <div class="bg-[#0b132b] p-6 rounded-2xl border border-[#1e293b] shadow-lg">
+                      <p class="text-[10px] text-cyan-500 font-bold uppercase mb-2 tracking-widest">TCA SÜRESİ</p>
+                      <p class="text-3xl font-black text-white">${sat.time_to_tca} ${sat.time_to_tca !== "YOK" ? "s" : ""}</p>
+                  </div>
+                  <div class="bg-[#0b132b] p-6 rounded-2xl border border-[#1e293b] shadow-lg">
+                      <p class="text-[10px] text-cyan-500 font-bold uppercase mb-2 tracking-widest">KAÇIRMA MES.</p>
+                      <p class="text-3xl font-black text-white">${sat.miss_distance_km} ${sat.miss_distance_km !== "YOK" ? "km" : ""}</p>
+                  </div>
+                  <div class="bg-[#0b132b] p-6 rounded-2xl border border-[#1e293b] shadow-lg">
+                      <p class="text-[10px] text-cyan-500 font-bold uppercase mb-2 tracking-widest">SİSTEM DURUMU</p>
+                      <p class="text-3xl font-black ${riskColor}">${statusText}</p>
+                  </div>
+              </div>
+
+              <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                  ${featsHtml}
+              </div>
+          </div>
+      `;
+  }
+
+  function onCanvasClick(event) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+
+    const intersects = raycaster.intersectObjects(hitboxes, false);
+    if (intersects.length > 0) {
+
+      const satelliteName = intersects[0].object.userData.name;
+      addLog(`Uydu seçildi: ${satelliteName}`, "info");
+      focusSatellite(satelliteName);
+    }
+  }
+
+  function onCanvasHover(event) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+
+    const intersects = raycaster.intersectObjects(hitboxes, false);
+    document.body.style.cursor = intersects.length > 0 ? 'pointer' : 'default';
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+    if(earth) earth.rotation.y += 0.0005;
+    if(stars) stars.rotation.y += 0.0001;
+    if(controls) controls.update();
+
+    satelliteMeshes.forEach(m => {
+      m.userData.angle += m.userData.speed;
+      m.position.x = Math.cos(m.userData.angle) * m.userData.radius;
+      m.position.z = Math.sin(m.userData.angle) * m.userData.radius;
+      m.position.y = Math.sin(m.userData.angle) * m.userData.radius * m.userData.inclination;
+
+      m.rotation.y += 0.005;
+      m.rotation.z += 0.002;
+    });
+    renderer.render(scene, camera);
+  }
+
+  window.onload = async () => {
+    addLog("ORBITEYES SISTEMI başlatılıyor...", "info");
+    init3D();
+    await preloadModels();
+    await fetchSatellites();
+
+    setInterval(async () => {
+      await fetchSatellites();
+    }, 10000);
+  };
+
+  setInterval(() => {
+    document.getElementById('clock').innerText = new Date().toLocaleTimeString('en-GB') + " UTC";
+  }, 1000);
+</script>
+</body>
+</html>
